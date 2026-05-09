@@ -1,0 +1,20 @@
+{
+	"schemaVersion": 1,
+	"id": "autostore",
+	"version": "${version}",
+	"name": "AutoStore",
+	"description": "Auto stores items into Material Bag",
+	"authors": ["Roboo"],
+	"contact": {},
+	"license": "MIT",
+	"icon": "assets/autostore/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.roboo.autostore.AutoStoreClient"]
+	},
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"minecraft": "~1.21.11",
+		"fabric-api": "*"
+	}
+}
