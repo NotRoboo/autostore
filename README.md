@@ -1,4 +1,4 @@
-# autostore
+# AutoStore for MC 1.21.11
 
 ## To Install
 
