@@ -1,9 +1,13 @@
 # autostore
 
-## Setup
+## To Install
 
-For setup instructions, please see the [Fabric Documentation page](https://docs.fabricmc.net/develop/getting-started/creating-a-project#setting-up) related to the IDE that you are using.
+Either download .jar from releases or compile yourself
+Put Mod in your mods folder
+Requires Fabric API
 
-## License
+## To Use
 
-This template is available under the CC0 license. Feel free to learn from it and incorporate it in your own projects.
+To use look at mob and /mbag toggle
+To change length between deposits do /mbag timer #(seconds) (/mbag timer 300 will deposit every 300 seconds) Defailt 1200 Seconds (20 minutes)
+
