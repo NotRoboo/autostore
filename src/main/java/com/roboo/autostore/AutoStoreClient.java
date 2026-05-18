@@ -1,14 +1,11 @@
 package com.roboo.autostore;
 
-import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
-
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.inventory.ClickType;
@@ -19,181 +16,80 @@ import java.util.Deque;
 public class AutoStoreClient implements ClientModInitializer {
 
     public static boolean enabled = false;
-    public static int delaySeconds = 1200;
-
-    public static int hudX = 10;
-    public static int hudY = 30;
 
     private static final Minecraft mc = Minecraft.getInstance();
 
-    private enum State { IDLE, WAITING_TO_OPEN, OPENING, DRAINING, RESCANNING }
-    private static State state = State.IDLE;
+    public enum State { IDLE, WAITING_TO_OPEN, OPENING, DRAINING, RESCANNING }
+    private State state = State.IDLE;
 
-    private static long nextCycleTime = 0;
-    private static int tickCooldown = 0;
+    public interface StateRef { State get(); }
 
-    private static final Deque<Integer> clickQueue = new ArrayDeque<>();
+    private final long[] nextCycleTime = { 0 };
+    private int tickCooldown = 0;
+    private final Deque<Integer> clickQueue = new ArrayDeque<>();
+
+    private boolean savedToggleUse = false;
+
+    private String lastContainerTitle = "";
+    private long lastContainerTime = 0;
+    private static final long DUPLICATE_WINDOW_MS = 5000;
 
     @Override
     public void onInitializeClient() {
+        ModConfig.load();
 
-        // =========================
-        // DISCONNECT / SERVER CHANGE
-        // =========================
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            enabled = false;
+        HudHelper.register(() -> state, clickQueue, nextCycleTime);
+        Commands.register(this);
+
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> disableAndCleanup());
+
+        ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
+            if (!enabled) return;
+            if (!(screen instanceof AbstractContainerScreen<?> cs)) return;
+
+            String title = cs.getTitle().getString();
+            if (title.contains("Material Bag")) return;
+
+            ScreenEvents.remove(screen).register(s -> {
+                long now = System.currentTimeMillis();
+                if (title.equals(lastContainerTitle) && (now - lastContainerTime) < DUPLICATE_WINDOW_MS) {
+                    disableAndCleanup();
+                    if (mc.player != null)
+                        mc.player.displayClientMessage(
+                                Component.literal("§e[AutoStore] §cDisabled: same container opened twice within 5s"), false
+                        );
+                    return;
+                }
+                lastContainerTitle = title;
+                lastContainerTime = now;
+            });
+        });
+
+        ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
+    }
+
+    public void toggle() {
+        if (!enabled && InventoryHelper.findMaterialBagSlot() == -1) {
+            msg("§cNo Material Bag found in hotbar!");
+            return;
+        }
+        enabled = !enabled;
+        msg(enabled ? "§aON" : "§cOFF");
+        if (enabled) {
+            savedToggleUse = mc.options.toggleUse().get();
+            if (savedToggleUse) {
+                mc.options.toggleUse().set(false);
+                mc.options.save();
+            }
+            nextCycleTime[0] = System.currentTimeMillis() + (cfg().delaySeconds * 1000L);
+            InputHelper.holdRightClick(true);
+        } else {
+            restoreToggleUse();
             InputHelper.stopAll();
             state = State.IDLE;
             clickQueue.clear();
             tickCooldown = 0;
-        });
-
-        // =========================
-        // COMMANDS
-        // =========================
-        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
-            dispatcher.register(
-                    ClientCommandManager.literal("mbag")
-                            .then(ClientCommandManager.literal("toggle")
-                                    .executes(ctx -> {
-                                        if (!enabled) {
-                                            // Only allow enabling if material bag is in hotbar
-                                            if (InventoryHelper.findMaterialBagSlot() == -1) {
-                                                if (mc.player != null) {
-                                                    mc.player.displayClientMessage(
-                                                            Component.literal("§e[AutoStore] §cNo Material Bag found in hotbar!" +
-                                                                    " Please place Material Bag in hotbar and try again!"), false
-
-                                                    );
-                                                }
-                                                return 1;
-                                            }
-                                        }
-                                        enabled = !enabled;
-                                        if (mc.player != null) {
-                                            mc.player.displayClientMessage(
-                                                    Component.literal("§e[AutoStore] " + (enabled ? "§aON" : "§cOFF")), false
-                                            );
-                                        }
-                                        if (enabled) {
-                                            nextCycleTime = System.currentTimeMillis() + (delaySeconds * 1000L);
-                                            InputHelper.holdRightClick(true);
-                                        } else {
-                                            InputHelper.stopAll();
-                                            state = State.IDLE;
-                                            clickQueue.clear();
-                                            tickCooldown = 0;
-                                        }
-                                        return 1;
-                                    })
-                            )
-                            .then(ClientCommandManager.literal("timer")
-                                    .then(ClientCommandManager.argument("seconds", IntegerArgumentType.integer(5, 6000))
-                                            .executes(ctx -> {
-                                                delaySeconds = IntegerArgumentType.getInteger(ctx, "seconds");
-                                                if (mc.player != null) {
-                                                    mc.player.displayClientMessage(
-                                                            Component.literal("§e[AutoStore] §ftimer set to §e" + delaySeconds + "s"), false
-                                                    );
-                                                }
-                                                return 1;
-                                            })
-                                    )
-                            )
-                            .then(ClientCommandManager.literal("pos")
-                                    .then(ClientCommandManager.argument("x", IntegerArgumentType.integer(0, 1920))
-                                            .then(ClientCommandManager.argument("y", IntegerArgumentType.integer(0, 1080))
-                                                    .executes(ctx -> {
-                                                        hudX = IntegerArgumentType.getInteger(ctx, "x");
-                                                        hudY = IntegerArgumentType.getInteger(ctx, "y");
-                                                        if (mc.player != null) {
-                                                            mc.player.displayClientMessage(
-                                                                    Component.literal("AutoStore HUD moved to §e" + hudX + ", " + hudY), false
-                                                            );
-                                                        }
-                                                        return 1;
-                                                    })
-                                            )
-                                    )
-                            )
-                            .then(ClientCommandManager.literal("debug")
-                                    .executes(ctx -> {
-                                        if (mc.player == null) return 0;
-
-                                        var inv = mc.player.getInventory();
-                                        mc.player.displayClientMessage(Component.literal("=== Player Inventory ==="), false);
-                                        for (int i = 0; i < inv.getContainerSize(); i++) {
-                                            var stack = inv.getItem(i);
-                                            if (!stack.isEmpty() && stack.getCount() >= 64) {
-                                                mc.player.displayClientMessage(Component.literal(
-                                                        "Slot " + i + ": [" + stack.getHoverName().getString() + "] x" + stack.getCount()
-                                                ), false);
-                                            }
-                                        }
-
-                                        if (mc.screen instanceof net.minecraft.client.gui.screens.inventory.AbstractContainerScreen<?>) {
-                                            var handler = mc.player.containerMenu;
-                                            mc.player.displayClientMessage(Component.literal("=== GUI Slots ==="), false);
-                                            for (int i = 0; i < handler.slots.size(); i++) {
-                                                var stack = handler.getSlot(i).getItem();
-                                                if (!stack.isEmpty()) {
-                                                    mc.player.displayClientMessage(Component.literal(
-                                                            "Slot " + i + ": [" + stack.getHoverName().getString() + "]"
-                                                    ), false);
-                                                }
-                                            }
-
-                                            // Lore debug for mode/amount buttons
-                                            mc.player.displayClientMessage(Component.literal("=== Lore Debug ==="), false);
-                                            for (int i = 0; i < handler.slots.size(); i++) {
-                                                var stack = handler.getSlot(i).getItem();
-                                                if (stack.isEmpty()) continue;
-                                                String name = stack.getHoverName().getString();
-                                                if (name.contains("Material Bag Mode") || name.contains("Set Amount")) {
-                                                    mc.player.displayClientMessage(Component.literal(
-                                                            "Slot " + i + " name: [" + name + "]"
-                                                    ), false);
-                                                    var lore = stack.get(DataComponents.LORE);
-                                                    if (lore != null) {
-                                                        for (var line : lore.lines()) {
-                                                            mc.player.displayClientMessage(Component.literal(
-                                                                    "  lore: [" + line.getString() + "]"
-                                                            ), false);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        return 1;
-                                    })
-                            )
-            );
-        });
-
-        ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
-
-        // =========================
-        // HUD
-        // =========================
-        HudRenderCallback.EVENT.register((graphics, delta) -> {
-            if (mc.player == null) return;
-
-            long remaining = Math.max(0, (nextCycleTime - System.currentTimeMillis()) / 1000);
-
-            String statusColor = enabled ? "§a" : "§c";
-            String statusText = enabled ? "ON" : "OFF";
-            graphics.drawString(mc.font, "§7[AutoStore] " + statusColor + statusText, hudX, hudY, 0xFFFFFF, true);
-
-            if (enabled) {
-                String detail = switch (state) {
-                    case IDLE, WAITING_TO_OPEN -> "§7Next in §e" + remaining + "s";
-                    case OPENING               -> "§7Opening bag...";
-                    case DRAINING              -> "§7Depositing... §e(" + clickQueue.size() + " left)";
-                    case RESCANNING            -> "§7Rescanning...";
-                };
-                graphics.drawString(mc.font, detail, hudX, hudY + 10, 0xFFFFFF, true);
-            }
-        });
+        }
     }
 
     // =========================
@@ -202,19 +98,12 @@ public class AutoStoreClient implements ClientModInitializer {
     private void onTick(Minecraft client) {
         if (mc.player == null) return;
 
-        // If enabled but bag disappears from hotbar while idle, disable
         if (enabled && state == State.IDLE && InventoryHelper.findMaterialBagSlot() == -1) {
-            enabled = false;
-            InputHelper.stopAll();
-            clickQueue.clear();
-            tickCooldown = 0;
-            mc.player.displayClientMessage(
-                    Component.literal("§cAutoStore disabled: Material Bag not found in hotbar"), false
-            );
+            disableAndCleanup();
+            msg("§cDisabled: Material Bag not found in hotbar");
             return;
         }
 
-        // Resume right click if chat or inv is closed
         if (enabled && state == State.IDLE && mc.screen == null) {
             InputHelper.holdRightClick(true);
         }
@@ -228,7 +117,7 @@ public class AutoStoreClient implements ClientModInitializer {
 
         switch (state) {
             case IDLE -> {
-                if (System.currentTimeMillis() >= nextCycleTime) {
+                if (System.currentTimeMillis() >= nextCycleTime[0]) {
                     InputHelper.holdRightClick(false);
                     state = State.WAITING_TO_OPEN;
                     tickCooldown = 20;
@@ -241,14 +130,11 @@ public class AutoStoreClient implements ClientModInitializer {
         }
     }
 
-    // =========================
-    // 1. OPEN THE BAG
-    // =========================
     private void startCycle() {
         int bagSlot = InventoryHelper.findMaterialBagSlot();
         if (bagSlot == -1) {
             InputHelper.holdRightClick(true);
-            nextCycleTime = System.currentTimeMillis() + 5000;
+            nextCycleTime[0] = System.currentTimeMillis() + 5000;
             state = State.IDLE;
             return;
         }
@@ -262,32 +148,19 @@ public class AutoStoreClient implements ClientModInitializer {
         tickCooldown = 6;
     }
 
-    // =========================
-    // 2. WAIT FOR GUI, CHECK SETTINGS, BUILD QUEUE
-    // =========================
     private void tryFinishOpen() {
-        if (!(mc.screen instanceof net.minecraft.client.gui.screens.inventory.AbstractContainerScreen<?>)) {
+        if (!(mc.screen instanceof AbstractContainerScreen<?>)) {
             tickCooldown = 2;
             return;
         }
 
-        // Step 1: ensure deposit mode
-        if (!ensureDepositMode()) {
-            tickCooldown = 6;
-            return;
-        }
+        if (!ensureDepositMode()) { tickCooldown = 6; return; }
+        if (!ensureAmount64())    { tickCooldown = 6; return; }
 
-        // Step 2: ensure amount is 64
-        if (!ensureAmount64()) {
-            tickCooldown = 6;
-            return;
-        }
-
-        // Step 3: build queue and start draining
         buildClickQueue();
 
         if (clickQueue.isEmpty()) {
-            mc.player.closeContainer();
+            if (mc.player != null) mc.player.closeContainer();
             finishCycle();
         } else {
             state = State.DRAINING;
@@ -295,131 +168,91 @@ public class AutoStoreClient implements ClientModInitializer {
         }
     }
 
-    // =========================
-    // CHECK AND SET DEPOSIT MODE
-    // =========================
     private boolean ensureDepositMode() {
+        if (mc.player == null) return true;
         var handler = mc.player.containerMenu;
-
         for (int i = 0; i < handler.slots.size(); i++) {
             var stack = handler.getSlot(i).getItem();
-            if (stack.isEmpty()) continue;
-            if (!stack.getHoverName().getString().contains("Material Bag Mode")) continue;
-
+            if (stack.isEmpty() || !stack.getHoverName().getString().contains("Material Bag Mode")) continue;
             var lore = stack.get(DataComponents.LORE);
             if (lore == null) continue;
-
             for (var line : lore.lines()) {
-                String lineText = line.getString();
-                if (lineText.contains("Current Mode: Deposit")) return true;
-                if (lineText.contains("Current Mode: Withdraw")) {
-                    mc.gameMode.handleInventoryMouseClick(
-                            handler.containerId, i, 0, ClickType.PICKUP, mc.player
-                    );
+                String text = line.getString();
+                if (text.contains("Current Mode: Deposit")) return true;
+                if (text.contains("Current Mode: Withdraw")) {
+                    if (mc.gameMode != null)
+                        mc.gameMode.handleInventoryMouseClick(handler.containerId, i, 0, ClickType.PICKUP, mc.player);
                     return false;
                 }
             }
         }
-
         return true;
     }
 
-    // =========================
-    // CHECK AND SET AMOUNT TO 64
-    // =========================
     private boolean ensureAmount64() {
+        if (mc.player == null) return true;
         var handler = mc.player.containerMenu;
-
         for (int i = 0; i < handler.slots.size(); i++) {
             var stack = handler.getSlot(i).getItem();
-            if (stack.isEmpty()) continue;
-            if (!stack.getHoverName().getString().contains("Set Amount")) continue;
-
+            if (stack.isEmpty() || !stack.getHoverName().getString().contains("Set Amount")) continue;
             var lore = stack.get(DataComponents.LORE);
             if (lore == null) continue;
-
             for (var line : lore.lines()) {
-                String lineText = line.getString();
-                if (lineText.contains("Current amount: 64")) return true;
-                if (lineText.contains("Current amount: 1") || lineText.contains("Current amount: 8")) {
-                    mc.gameMode.handleInventoryMouseClick(
-                            handler.containerId, i, 0, ClickType.PICKUP, mc.player
-                    );
+                String text = line.getString();
+                if (text.contains("Current amount: 64")) return true;
+                if (text.contains("Current amount: 1") || text.contains("Current amount: 8")) {
+                    if (mc.gameMode != null)
+                        mc.gameMode.handleInventoryMouseClick(handler.containerId, i, 0, ClickType.PICKUP, mc.player);
                     return false;
                 }
             }
         }
-
         return true;
     }
 
-    // =========================
-    // 3. BUILD CLICK QUEUE
-    // =========================
     private void buildClickQueue() {
         clickQueue.clear();
-
+        if (mc.player == null) return;
         var inv = mc.player.getInventory();
         var handler = mc.player.containerMenu;
 
         for (int i = 0; i < inv.getContainerSize(); i++) {
             var stack = inv.getItem(i);
             if (stack.isEmpty()) continue;
-
             int fullStacks = stack.getCount() / 64;
             if (fullStacks == 0) continue;
-
-            String itemName = stack.getHoverName().getString();
-            int guiSlot = findGuiSlotByName(itemName, handler);
+            int guiSlot = findGuiSlotByName(stack.getHoverName().getString(), handler);
             if (guiSlot == -1) continue;
-
-            for (int s = 0; s < fullStacks; s++) {
-                clickQueue.add(guiSlot);
-            }
+            for (int s = 0; s < fullStacks; s++) clickQueue.add(guiSlot);
         }
     }
 
-    // =========================
-    // 4. CLICK ONE SLOT PER TICK
-    // =========================
     private void drainOneTick() {
-        if (!(mc.screen instanceof net.minecraft.client.gui.screens.inventory.AbstractContainerScreen<?>)) {
+        if (!(mc.screen instanceof AbstractContainerScreen<?>)) {
             finishCycle();
             return;
         }
-
         if (clickQueue.isEmpty()) {
             state = State.RESCANNING;
             tickCooldown = 6;
             return;
         }
-
-        int slot = clickQueue.poll();
-
-        mc.gameMode.handleInventoryMouseClick(
-                mc.player.containerMenu.containerId,
-                slot,
-                0,
-                ClickType.PICKUP,
-                mc.player
-        );
-
-        tickCooldown = 2;
+        if (mc.player != null && mc.gameMode != null) {
+            mc.gameMode.handleInventoryMouseClick(
+                    mc.player.containerMenu.containerId, clickQueue.poll(), 0, ClickType.PICKUP, mc.player
+            );
+        }
+        tickCooldown = 5 + mc.player.getRandom().nextInt(4);
     }
 
-    // =========================
-    // 5. RESCAN AFTER DRAIN
-    // =========================
     private void rescanAndContinue() {
-        if (!(mc.screen instanceof net.minecraft.client.gui.screens.inventory.AbstractContainerScreen<?>)) {
+        if (!(mc.screen instanceof AbstractContainerScreen<?>)) {
             finishCycle();
             return;
         }
-
         buildClickQueue();
-
         if (clickQueue.isEmpty()) {
-            mc.player.closeContainer();
+            if (mc.player != null) mc.player.closeContainer();
             finishCycle();
         } else {
             state = State.DRAINING;
@@ -427,31 +260,45 @@ public class AutoStoreClient implements ClientModInitializer {
         }
     }
 
-    // =========================
-    // FIND GUI BUTTON BY NAME
-    // =========================
     private int findGuiSlotByName(String itemName, net.minecraft.world.inventory.AbstractContainerMenu handler) {
-
         int bagSlotCount = handler.slots.size() - 36;
-
         for (int i = 0; i < bagSlotCount; i++) {
             var stack = handler.getSlot(i).getItem();
-            if (!stack.isEmpty() && stack.getHoverName().getString().equals(itemName)) {
-                return i;
-            }
+            if (!stack.isEmpty() && stack.getHoverName().getString().equals(itemName)) return i;
         }
         return -1;
     }
 
-    // =========================
-    // FINISH
-    // =========================
     private void finishCycle() {
         state = State.IDLE;
         clickQueue.clear();
         tickCooldown = 0;
         InventoryHelper.restoreSlot();
-        nextCycleTime = System.currentTimeMillis() + (delaySeconds * 1000L);
+        nextCycleTime[0] = System.currentTimeMillis() + (cfg().delaySeconds * 1000L);
         InputHelper.holdRightClick(true);
+    }
+
+    private void restoreToggleUse() {
+        if (savedToggleUse) {
+            mc.options.toggleUse().set(true);
+            mc.options.save();
+            savedToggleUse = false;
+        }
+    }
+
+    public void disableAndCleanup() {
+        enabled = false;
+        restoreToggleUse();
+        InputHelper.stopAll();
+        state = State.IDLE;
+        clickQueue.clear();
+        tickCooldown = 0;
+    }
+
+    private static ModConfig cfg() { return ModConfig.get(); }
+
+    public void msg(String text) {
+        if (mc.player != null)
+            mc.player.displayClientMessage(Component.literal("§e[AutoStore] " + text), false);
     }
 }
